@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/chromedp/cdproto/target"
 )
 
 // closeOldestTab evicts the tab with the earliest CreatedAt timestamp.
@@ -146,6 +148,22 @@ func (tm *TabManager) purgeTrackedTabState(tabID, cdpTargetID string) bool {
 	}
 	tm.mu.Unlock()
 
+	tm.cleanupTabResources(resolvedTabID, resolvedCDPID)
+	// Notify listeners (e.g. session persistence) that a tab disappeared,
+	// regardless of whether the trigger was a deliberate CloseTab, an eviction,
+	// the auto-close lifecycle timer, or Chrome reporting the target gone
+	// (CleanStaleTabs / user closing the tab in headed Chrome directly).
+	if tm.onAfterClose != nil {
+		tm.onAfterClose()
+	}
+	return true
+}
+
+func (tm *TabManager) cleanupTabResources(resolvedTabID, resolvedCDPID string) {
+	// Re-adoption reuses this ID, so release its capture slot before creating again.
+	if tm.netMonitor != nil && tm.isLaunchTarget(target.ID(resolvedCDPID)) {
+		tm.netMonitor.StopCapture(resolvedTabID)
+	}
 	if tm.dialogMgr != nil {
 		tm.dialogMgr.ClearPending(resolvedTabID)
 	}
@@ -166,14 +184,6 @@ func (tm *TabManager) purgeTrackedTabState(tabID, cdpTargetID string) bool {
 	for _, hook := range hooks {
 		hook(resolvedTabID)
 	}
-	// Notify listeners (e.g. session persistence) that a tab disappeared,
-	// regardless of whether the trigger was a deliberate CloseTab, an eviction,
-	// the auto-close lifecycle timer, or Chrome reporting the target gone
-	// (CleanStaleTabs / user closing the tab in headed Chrome directly).
-	if tm.onAfterClose != nil {
-		tm.onAfterClose()
-	}
-	return true
 }
 
 func (tm *TabManager) lookupTrackedTabForCleanup(tabID, cdpTargetID string) (string, string, context.CancelFunc, bool) {

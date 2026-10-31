@@ -14,6 +14,9 @@ func (tm *TabManager) trackedCDPIDs() map[string]bool {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	out := make(map[string]bool, len(tm.tabs))
+	if tm.launchTarget != "" {
+		out[string(tm.launchTarget)] = true
+	}
 	for _, entry := range tm.tabs {
 		if entry != nil && entry.CDPID != "" {
 			out[entry.CDPID] = true
@@ -41,6 +44,9 @@ func selectOrphanTargets(tracked map[string]bool, pages []*target.Info, limit in
 }
 
 func (tm *TabManager) closeTarget(id target.ID) bool {
+	if tm.isLaunchTarget(id) {
+		return false
+	}
 	closeCtx, cancel := context.WithTimeout(tm.browserCtx, 5*time.Second)
 	defer cancel()
 	c := chromedp.FromContext(closeCtx)

@@ -14,6 +14,9 @@ Use tab-scoped HTTP routes once you already have a tab ID. In the CLI, use the n
 Open a new tab with `pinchtab nav <url> --new-tab`. There are no subcommands such as
 `pinchtab tab navigate` or `pinchtab tab click`.
 
+On an instance PinchTab launched, the first tab reuses the browser's launch page.
+Closing the last tab leaves one blank page that the next tab reuses.
+
 ## Top-Level Browser Commands
 
 These pages cover the shorthand routes and matching CLI commands:

@@ -193,7 +193,10 @@ func (nm *NetworkMonitor) StartCaptureWithSize(tabCtx context.Context, tabID str
 	go func() {
 		<-listenerCtx.Done()
 		nm.mu.Lock()
-		delete(nm.listeners, tabID)
+		// A recycled target may already have a new buffer and listener.
+		if nm.buffers[tabID] == buf {
+			delete(nm.listeners, tabID)
+		}
 		nm.mu.Unlock()
 	}()
 

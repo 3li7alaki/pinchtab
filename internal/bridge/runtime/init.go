@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/browsers"
 	_ "github.com/pinchtab/pinchtab/internal/browsers/builtin"
@@ -36,6 +37,7 @@ type launchGeoAlignment struct {
 
 type Hooks struct {
 	SetHumanRandSeed        func(int64)
+	SetLaunchStealthScript  func(page.ScriptIdentifier)
 	IsProfileLockError      func(string) bool
 	ClearStaleProfileLocks  func(profileDir, errMsg string) (bool, error)
 	ConfigureBrowserProcess func(*exec.Cmd)
@@ -260,20 +262,20 @@ func setupAllocator(cfg *config.RuntimeConfig, binary string, bundle *stealth.Bu
 	return ctx, cancel, opts, debugPort, nil
 }
 
-func applyStartupStealth(ctx context.Context, cfg *config.RuntimeConfig, bundle *stealth.Bundle, script string) error {
+func applyStartupStealth(ctx context.Context, cfg *config.RuntimeConfig, bundle *stealth.Bundle, script string) (page.ScriptIdentifier, error) {
 	if !config.PinchTabStealthDefaultsDisabled(cfg) {
 		ua := ""
 		if bundle != nil {
 			ua = bundle.LaunchUserAgent()
 		}
 		if err := stealth.ApplyTargetEmulation(ctx, cfg, ua); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if strings.TrimSpace(script) == "" {
-		return nil
+		return "", nil
 	}
-	return injectedScript(ctx, script)
+	return page.AddScriptToEvaluateOnNewDocument(script).Do(ctx)
 }
 
 func missingBrowserBinaryError(cfg *config.RuntimeConfig) error {
@@ -288,14 +290,6 @@ func missingBrowserBinaryError(cfg *config.RuntimeConfig) error {
 			strings.ToLower(name), target, target, name)
 	}
 	return fmt.Errorf("browser binary not found for browser target %q: set browser.targets.%s.binary in config", target, target)
-}
-
-func injectedScript(ctx context.Context, script string) error {
-	return chromedp.FromContext(ctx).Target.Execute(ctx,
-		"Page.addScriptToEvaluateOnNewDocument",
-		map[string]interface{}{
-			"source": script,
-		}, nil)
 }
 
 func geoProviderForConfig(cfg *config.RuntimeConfig) geo.Provider {

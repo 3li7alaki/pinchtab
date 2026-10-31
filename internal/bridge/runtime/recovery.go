@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/browsers"
 	"github.com/pinchtab/pinchtab/internal/config"
@@ -105,12 +106,18 @@ func startBrowserWithRecovery(parentCtx context.Context, cfg *config.RuntimeConf
 		return nil, nil, stealth.LaunchModeUninitialized, fmt.Errorf("failed to connect to browser: %w", err)
 	}
 
+	var scriptID page.ScriptIdentifier
 	if err := chromedp.Run(browserCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return applyStartupStealth(ctx, cfg, bundle, bundle.Script)
+		var err error
+		scriptID, err = applyStartupStealth(ctx, cfg, bundle, bundle.Script)
+		return err
 	})); err != nil {
 		browserCancel()
 		allocCancel()
 		return nil, nil, stealth.LaunchModeUninitialized, fmt.Errorf("failed to inject stealth script: %w", err)
+	}
+	if hooks.SetLaunchStealthScript != nil {
+		hooks.SetLaunchStealthScript(scriptID)
 	}
 
 	return browserCtx, func() {
@@ -192,7 +199,8 @@ func startBrowserWithRemoteAllocator(parentCtx context.Context, cfg *config.Runt
 	browserCtx, browserCancel := chromedp.NewContext(remoteAllocCtx)
 
 	if err := chromedp.Run(browserCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return applyStartupStealth(ctx, cfg, bundle, injectedStealthScript)
+		_, err := applyStartupStealth(ctx, cfg, bundle, injectedStealthScript)
+		return err
 	})); err != nil {
 		browserCancel()
 		remoteAllocCancel()

@@ -80,7 +80,7 @@ end_test
 
 # The secure pinchtab instance is configured with maxTabs=2 and close_lru.
 # Tests that opening a 3rd managed tab evicts the least recently used one.
-# Note: Chrome keeps an initial about:blank target that is unmanaged.
+# PinchTab reuses Chrome's initial about:blank target for the first managed tab.
 # Eviction is based on managed tab count, not Chrome target count.
 
 # ─────────────────────────────────────────────────────────────────

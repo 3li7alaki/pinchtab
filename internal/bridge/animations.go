@@ -23,7 +23,10 @@ const DisableAnimationsCSS = `
 func (b *Bridge) InjectNoAnimations(ctx context.Context) error {
 	return chromedp.Run(ctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, err := page.AddScriptToEvaluateOnNewDocument(DisableAnimationsCSS).Do(ctx)
+			id, err := page.AddScriptToEvaluateOnNewDocument(DisableAnimationsCSS).Do(ctx)
+			if err == nil {
+				b.rememberLaunchScript(ctx, id)
+			}
 			return err
 		}),
 		chromedp.ActionFunc(func(ctx context.Context) error {

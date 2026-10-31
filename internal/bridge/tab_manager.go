@@ -9,6 +9,7 @@ import (
 	"time"
 
 	cdp "github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
@@ -46,6 +47,12 @@ type TabManager struct {
 	onTabRemovedHooks []func(tabID string)
 	netMonitor        *NetworkMonitor
 	currentTab        string // ID of the most recently used tab
+	spareTarget       target.ID
+	launchTarget      target.ID
+	launchCtx         context.Context
+	launchScriptID    page.ScriptIdentifier
+	launchScripts     []page.ScriptIdentifier
+	launchMu          sync.Mutex
 	lastStaleSweep    time.Time
 	executor          *TabExecutor
 	guardOnce         sync.Once
@@ -85,6 +92,93 @@ func NewTabManager(browserCtx context.Context, cfg *config.RuntimeConfig, idMgr 
 
 func (tm *TabManager) SetDialogManager(dm *DialogManager) {
 	tm.dialogMgr = dm
+}
+
+// SetLaunchTarget enables reuse only for a page from PinchTab's local allocator.
+func (tm *TabManager) SetLaunchTarget(id target.ID, scriptID page.ScriptIdentifier) {
+	tm.mu.Lock()
+	tm.spareTarget = id
+	tm.launchTarget = id
+	tm.launchScriptID = scriptID
+	tm.mu.Unlock()
+}
+
+func (tm *TabManager) isLaunchTarget(id target.ID) bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return id != "" && id == tm.launchTarget
+}
+
+func (tm *TabManager) newTabContext(id target.ID) (context.Context, context.CancelFunc, error) {
+	if !tm.isLaunchTarget(id) {
+		ctx, cancel := chromedp.NewContext(tm.browserCtx, chromedp.WithTargetID(id))
+		return ctx, cancel, nil
+	}
+	tm.launchMu.Lock()
+	defer tm.launchMu.Unlock()
+	tm.mu.Lock()
+	if tm.launchCtx == nil {
+		tm.launchCtx, _ = chromedp.NewContext(tm.browserCtx, chromedp.WithTargetID(id))
+	}
+	ctx := tm.launchCtx
+	scriptID := tm.launchScriptID
+	tm.launchScriptID = ""
+	tm.spareTarget = ""
+	tm.mu.Unlock()
+	if scriptID != "" {
+		removeCtx, cancel := context.WithTimeout(tm.browserCtx, tabCreateTimeout)
+		defer cancel()
+		if err := chromedp.Run(removeCtx, page.RemoveScriptToEvaluateOnNewDocument(scriptID)); err != nil {
+			slog.Warn("remove launch stealth script failed", "target", id, "err", err)
+		}
+	}
+	// Start the reusable session on its lifetime context; cancel only per-use listeners.
+	err := chromedp.Run(ctx)
+	tabCtx, cancel := context.WithCancel(ctx)
+	return tabCtx, cancel, err
+}
+
+func (tm *TabManager) rememberLaunchScript(ctx context.Context, id page.ScriptIdentifier) {
+	if tm == nil || id == "" {
+		return
+	}
+	c := chromedp.FromContext(ctx)
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.launchCtx != nil && c == chromedp.FromContext(tm.launchCtx) {
+		tm.launchScripts = append(tm.launchScripts, id)
+	}
+}
+
+func (tm *TabManager) recycleLaunchTarget() error {
+	tm.launchMu.Lock()
+	defer tm.launchMu.Unlock()
+	tm.mu.Lock()
+	ctx := tm.launchCtx
+	scripts := tm.launchScripts
+	tm.mu.Unlock()
+	if ctx == nil {
+		ctx = tm.browserCtx
+	}
+	ctx, cancel := context.WithTimeout(ctx, tabCreateTimeout)
+	defer cancel()
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		for _, id := range scripts {
+			if err := page.RemoveScriptToEvaluateOnNewDocument(id).Do(ctx); err != nil {
+				return err
+			}
+			tm.mu.Lock()
+			tm.launchScripts = tm.launchScripts[1:]
+			tm.mu.Unlock()
+		}
+		return fetch.Disable().Do(ctx)
+	}), chromedp.Navigate("about:blank")); err != nil {
+		return fmt.Errorf("reset launch page: %w", err)
+	}
+	tm.mu.Lock()
+	tm.spareTarget = tm.launchTarget
+	tm.mu.Unlock()
+	return nil
 }
 
 // SetOnAfterClose registers a callback fired whenever a tracked tab is removed
@@ -216,23 +310,42 @@ func (tm *TabManager) createTab(url, browserContextID string) (string, context.C
 	}
 	var targetID target.ID
 	createCtx, createCancel := context.WithTimeout(browserExecCtx, tabCreateTimeout)
-	params := target.CreateTarget("about:blank").WithFocus(false)
-	if browserContextID != "" {
-		params = params.WithBrowserContextID(cdp.BrowserContextID(browserContextID))
-	}
-	targetID, err = params.Do(createCtx)
-	if err != nil {
-		createCancel()
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", nil, nil, fmt.Errorf("create tab: browser did not open a new tab within %s — it may be out of memory or overloaded (close tabs or restart the instance)", tabCreateTimeout)
+	if browserContextID == "" {
+		tm.mu.Lock()
+		spare := tm.spareTarget
+		tm.spareTarget = ""
+		tm.mu.Unlock()
+		if spare != "" {
+			info, infoErr := target.GetTargetInfo().WithTargetID(spare).Do(createCtx)
+			tm.mu.RLock()
+			_, tracked := tm.tabs[tm.idMgr.TabIDFromCDPTarget(string(spare))]
+			tm.mu.RUnlock()
+			if infoErr == nil && info != nil && info.Type == "page" && info.URL == "about:blank" && info.OpenerID == "" && !tracked {
+				targetID = spare
+			}
 		}
-		return "", nil, nil, fmt.Errorf("create target: %w", err)
+	}
+	if targetID == "" {
+		params := target.CreateTarget("about:blank").WithFocus(false)
+		if browserContextID != "" {
+			params = params.WithBrowserContextID(cdp.BrowserContextID(browserContextID))
+		}
+		targetID, err = params.Do(createCtx)
+		if err != nil {
+			createCancel()
+			if errors.Is(err, context.DeadlineExceeded) {
+				return "", nil, nil, fmt.Errorf("create tab: browser did not open a new tab within %s — it may be out of memory or overloaded (close tabs or restart the instance)", tabCreateTimeout)
+			}
+			return "", nil, nil, fmt.Errorf("create target: %w", err)
+		}
 	}
 	createCancel()
 
-	ctx, cancel := chromedp.NewContext(tm.browserCtx,
-		chromedp.WithTargetID(targetID),
-	)
+	ctx, cancel, err := tm.newTabContext(targetID)
+	if err != nil {
+		tm.cleanupFailedTarget(targetID, cancel)
+		return "", nil, nil, fmt.Errorf("attach launch tab: %w", err)
+	}
 
 	rawCDPID := string(targetID)
 	tabID := tm.idMgr.TabIDFromCDPTarget(rawCDPID)
@@ -241,10 +354,7 @@ func (tm *TabManager) createTab(url, browserContextID string) (string, context.C
 		if err := chromedp.Run(ctx, chromedp.ActionFunc(func(execCtx context.Context) error {
 			return tm.onTabSetup(execCtx, tabID)
 		})); err != nil {
-			cancel()
-			if execCtx, execErr := browserExecutorContext(tm.browserCtx); execErr == nil {
-				_ = target.CloseTarget(targetID).Do(execCtx)
-			}
+			tm.cleanupFailedTarget(targetID, cancel)
 			return "", nil, nil, fmt.Errorf("setup new tab: %w", err)
 		}
 	}
@@ -271,10 +381,7 @@ func (tm *TabManager) createTab(url, browserContextID string) (string, context.C
 		navCtx, navCancel := context.WithTimeout(ctx, tabCreateNavTimeout)
 		if err := chromedp.Run(navCtx, chromedp.Navigate(url)); err != nil {
 			navCancel()
-			cancel()
-			if execCtx, execErr := browserExecutorContext(tm.browserCtx); execErr == nil {
-				_ = target.CloseTarget(targetID).Do(execCtx)
-			}
+			tm.cleanupFailedTarget(targetID, cancel)
 			if errors.Is(err, context.DeadlineExceeded) {
 				return "", nil, nil, fmt.Errorf("navigate new tab: page did not load within %s — the browser may be out of memory or overloaded (close tabs or restart the instance)", tabCreateNavTimeout)
 			}
@@ -313,6 +420,20 @@ func (tm *TabManager) createTab(url, browserContextID string) (string, context.C
 	return tabID, ctx, cancel, nil
 }
 
+func (tm *TabManager) cleanupFailedTarget(id target.ID, cancel context.CancelFunc) {
+	cancel()
+	if tm.isLaunchTarget(id) {
+		tm.cleanupTabResources(tm.idMgr.TabIDFromCDPTarget(string(id)), string(id))
+		if err := tm.recycleLaunchTarget(); err != nil {
+			slog.Warn("reset failed launch page", "err", err)
+		}
+		return
+	}
+	if execCtx, err := browserExecutorContext(tm.browserCtx); err == nil {
+		_ = target.CloseTarget(id).Do(execCtx)
+	}
+}
+
 // ErrCannotCloseLastTab is the last-tab precondition: at least one tab must
 // remain or Chrome exits and takes the server down. It is a client precondition,
 // not a server fault, so handlers classify it as a 4xx via errors.Is rather than
@@ -323,6 +444,17 @@ func (tm *TabManager) CloseTab(tabID string) error {
 	if tm == nil {
 		return fmt.Errorf("tab manager not initialized")
 	}
+	tm.mu.RLock()
+	entry, tracked := tm.tabs[tabID]
+	tm.mu.RUnlock()
+	cdpTargetID := tabID
+	if tracked && entry.CDPID != "" {
+		cdpTargetID = entry.CDPID
+	}
+	if tm.isLaunchTarget(target.ID(cdpTargetID)) {
+		tm.purgeTrackedTabState(tabID, cdpTargetID)
+		return tm.recycleLaunchTarget()
+	}
 	// Guard against closing the last tab to prevent Chrome from exiting
 	targets, err := tm.ListTargets()
 	if err != nil {
@@ -332,17 +464,8 @@ func (tm *TabManager) CloseTab(tabID string) error {
 		return ErrCannotCloseLastTab
 	}
 
-	tm.mu.Lock()
-	entry, tracked := tm.tabs[tabID]
-	tm.mu.Unlock()
-
 	if tracked && entry.Cancel != nil {
 		entry.Cancel()
-	}
-
-	cdpTargetID := tabID
-	if tracked && entry.CDPID != "" {
-		cdpTargetID = entry.CDPID
 	}
 
 	closeCtx, closeCancel := context.WithTimeout(tm.browserCtx, 5*time.Second)

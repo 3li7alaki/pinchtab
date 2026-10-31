@@ -229,6 +229,7 @@ func (b *Bridge) AddScriptToEvaluateOnNewDocument(ctx context.Context, source st
 			return err
 		}
 		identifier = string(id)
+		b.rememberLaunchScript(ctx, id)
 		return nil
 	}))
 	return identifier, err

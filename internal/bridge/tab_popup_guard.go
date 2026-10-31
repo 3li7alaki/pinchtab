@@ -56,6 +56,9 @@ func (tm *TabManager) StartBrowserGuards() {
 }
 
 func (tm *TabManager) closePopupTarget(targetID, openerID target.ID, url string) {
+	if tm.isLaunchTarget(targetID) {
+		return
+	}
 	closeCtx, cancel := context.WithTimeout(tm.browserCtx, 5*time.Second)
 	defer cancel()
 	logURL := internalurls.RedactForLog(url)

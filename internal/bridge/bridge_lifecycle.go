@@ -68,7 +68,10 @@ func (b *Bridge) injectStealth(ctx context.Context) {
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, err := page.AddScriptToEvaluateOnNewDocument(b.StealthBundle.Script).Do(ctx)
+			id, err := page.AddScriptToEvaluateOnNewDocument(b.StealthBundle.Script).Do(ctx)
+			if err == nil {
+				b.rememberLaunchScript(ctx, id)
+			}
 			return err
 		}),
 	); err != nil {
@@ -272,7 +275,7 @@ func (b *Bridge) EnsureBrowser(cfg *config.RuntimeConfig) error {
 	// and once they fill maxTabs the first new tab cannot open.
 	ClearChromeSessions(cfg.ProfileDir)
 	b.ensureStealthBundle()
-	allocCtx, allocCancel, browserCtx, browserCancel, launchMode, err := InitBrowser(cfg, b.StealthBundle)
+	allocCtx, allocCancel, browserCtx, browserCancel, launchMode, scriptID, err := InitBrowser(cfg, b.StealthBundle)
 	if err != nil {
 		return fmt.Errorf("failed to initialize browser: %w", err)
 	}
@@ -285,7 +288,15 @@ func (b *Bridge) EnsureBrowser(cfg *config.RuntimeConfig) error {
 	b.stealthLaunchMode = launchMode
 
 	if b.Config != nil && b.TabManager == nil {
-		b.reinitWiring(browserCtx, reinitWiringOpts{startBrowserGuards: true})
+		b.reinitWiring(browserCtx, reinitWiringOpts{})
+		if launchMode == stealth.LaunchModeAllocator {
+			if c := chromedp.FromContext(browserCtx); c != nil && c.Target != nil {
+				b.SetLaunchTarget(c.Target.TargetID, scriptID)
+			}
+		}
+		if !b.quietStealthObservers() {
+			b.StartBrowserGuards()
+		}
 	}
 
 	if b.Actions == nil {

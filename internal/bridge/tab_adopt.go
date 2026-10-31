@@ -135,10 +135,17 @@ func (tm *TabManager) adoptExistingTarget(targetID target.ID, enforceLimit bool)
 		}
 	}
 
-	ctx, cancel := chromedp.NewContext(tm.browserCtx, chromedp.WithTargetID(targetID))
-	consoleEnabled, err := tm.setupManagedTarget(ctx, tabID, rawCDPID)
+	ctx, cancel, err := tm.newTabContext(targetID)
+	var consoleEnabled bool
+	if err == nil {
+		consoleEnabled, err = tm.setupManagedTarget(ctx, tabID, rawCDPID)
+	}
 	if err != nil {
-		cancel()
+		if tm.isLaunchTarget(targetID) {
+			tm.cleanupFailedTarget(targetID, cancel)
+		} else {
+			cancel()
+		}
 		return "", fmt.Errorf("setup tab %s: %w", tabID, err)
 	}
 	now := time.Now()
